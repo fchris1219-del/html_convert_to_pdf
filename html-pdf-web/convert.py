@@ -169,7 +169,67 @@ async def render_pdf(input_path: Path, output_path: Path) -> None:
     tmp_path = input_path.with_suffix(".tmp_web.html")
     tmp_path.write_text(html, encoding="utf-8")
 
-    # JavaScript：将 color 和 border-color 中的 rgba() 合成为纯色。
+    # JavaScript Fix A：将渐变文字（background-clip:text）替换为纯色文字。
+    #
+    # 根因：CSS 渐变文字通过 background-clip:text + -webkit-text-fill-color:transparent
+    # 实现。PDF 渲染器和移动端阅读器（iOS Books、Android 内置 PDF）无法解析这种
+    # 渐变剪切路径，表现为文字完全不可见（透明）或显示为黑色方块。
+    #
+    # 修复策略：
+    #   1. 检测 webkitTextFillColor===transparent 且 backgroundClip===text 的元素
+    #   2. 从 backgroundImage 渐变中提取第一个非透明颜色作为纯色替代
+    #   3. 清除 backgroundClip / backgroundImage，让文字以纯色正常显示
+    FIX_GRADIENT_TEXT_JS = """
+(function fixGradientText() {
+  document.querySelectorAll('*').forEach(el => {
+    const cs = getComputedStyle(el);
+    const bgClip = cs.webkitBackgroundClip || cs.backgroundClip;
+    const fillColor = cs.webkitTextFillColor;
+
+    // 渐变文字标志：background-clip:text + 透明填充色
+    const isGradientText =
+      bgClip === 'text' &&
+      (fillColor === 'transparent' || fillColor === 'rgba(0, 0, 0, 0)');
+    if (!isGradientText) return;
+
+    // 从渐变中提取第一个可用颜色
+    let solidColor = null;
+    const bgImg = cs.backgroundImage;
+    if (bgImg && bgImg !== 'none') {
+      // 优先找 rgb/rgba 颜色
+      for (const m of [...bgImg.matchAll(/rgba?\\([^)]+\\)/g)]) {
+        const parts = m[0].match(/[\\d.]+/g);
+        if (parts && parts.length >= 3) {
+          const a = parts.length >= 4 ? parseFloat(parts[3]) : 1;
+          if (a > 0.3) {
+            solidColor = `rgb(${Math.round(+parts[0])},${Math.round(+parts[1])},${Math.round(+parts[2])})`;
+            break;
+          }
+        }
+      }
+      // 再找 hex 颜色
+      if (!solidColor) {
+        const hexMatch = bgImg.match(/#([0-9a-fA-F]{3,8})\\b/);
+        if (hexMatch) solidColor = hexMatch[0];
+      }
+    }
+    // fallback：使用元素的 color 属性（如有）或白色
+    if (!solidColor) {
+      const col = cs.color;
+      solidColor = (col && col !== 'rgba(0, 0, 0, 0)' && col !== 'transparent') ? col : '#ffffff';
+    }
+
+    // 清除渐变文字并设置纯色
+    el.style.webkitTextFillColor = solidColor;
+    el.style.color = solidColor;
+    el.style.backgroundImage = 'none';
+    el.style.backgroundClip = 'initial';
+    el.style.webkitBackgroundClip = 'initial';
+  });
+})();
+"""
+
+    # JavaScript Fix B：将 color 和 border-color 中的 rgba() 合成为纯色。
     #
     # 根因：Chromium PDF 渲染器对含 rgba() 的 color 或 border-color
     # 会把该元素包进独立的 PDF 透明组（transparency group）。
@@ -254,7 +314,9 @@ async def render_pdf(input_path: Path, output_path: Path) -> None:
             await page.goto(tmp_path.as_uri(), wait_until="networkidle", timeout=90000)
             await page.wait_for_timeout(1500)   # 等待字体 / 动画完成
 
-            # 将半透明 color / border-color 合成为纯色，消除 PDF 透明组边界缝线
+            # Fix A：渐变文字 → 纯色（移动端/PDF阅读器无法渲染渐变文字）
+            await page.evaluate(FIX_GRADIENT_TEXT_JS)
+            # Fix B：将半透明 color / border-color 合成为纯色，消除 PDF 透明组边界缝线
             await page.evaluate(FIX_RGBA_JS)
 
             await page.pdf(
