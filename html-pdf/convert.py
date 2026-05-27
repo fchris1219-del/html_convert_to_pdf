@@ -67,20 +67,35 @@ PDF_OVERRIDE_CSS = """
 </head>"""
 
 
+def _fix_clip_text_in_css(html: str) -> str:
+    """
+    找出 CSS 规则块中同时使用了
+      background-clip: text  +  -webkit-text-fill-color: transparent
+    的组合，在源码级别移除，避免 Chromium 生成 PDF SMask 透明组
+    （SMask 导致不同 PDF 阅读器出现黑色色块或红色/其他色偏）。
+    """
+    def fix_block(m):
+        block = m.group(0)
+        if not (re.search(r'background-clip\s*:\s*text', block) and
+                re.search(r'-webkit-text-fill-color\s*:\s*transparent', block)):
+            return block
+        block = re.sub(r'\s*background\s*:\s*linear-gradient\([^;]+\)\s*;', '', block)
+        block = re.sub(r'\s*-webkit-background-clip\s*:\s*text\s*;?', '', block)
+        block = re.sub(r'\s*background-clip\s*:\s*text\s*;?', '', block)
+        block = re.sub(r'\s*-webkit-text-fill-color\s*:\s*transparent\s*;?', '', block)
+        return block
+    return re.sub(r'\{[^{}]*\}', fix_block, html)
+
+
 def preprocess_html(html: str) -> str:
     """
-    Targeted fixes that prevent Chrome from creating compositing layers
-    which it then rasterizes into bitmaps instead of keeping as crisp vectors:
+    Targeted fixes to prevent rasterization and PDF color artifacts:
 
     1. Specific high-alpha white-ish panel rgba() → opaque equivalents
-       ONLY the whitelist above. Never replace all rgba() — that destroys
-       decorative gradients and completely breaks the visual design.
-
     2. SVG feGaussianBlur stdDeviation → 0
-       Blur filters force rasterization of the filtered element and its children.
-
-    3. Inject CSS override: remove filter/backdrop-filter/will-change,
-       strip .page margin/border-radius/box-shadow, set @page margin 0.
+    3. background-clip:text gradient text effect → removed at source
+       (prevents PDF SMask transparency groups causing red/black rendering bugs)
+    4. Inject CSS override
     """
     # Fix 1: targeted panel background replacements only
     for pattern, replacement in PANEL_REPLACEMENTS:
@@ -89,7 +104,10 @@ def preprocess_html(html: str) -> str:
     # Fix 2: zero out SVG blur stdDeviation
     html = re.sub(r'stdDeviation="[^"]*"', 'stdDeviation="0"', html)
 
-    # Fix 3: inject override style
+    # Fix 3: remove background-clip:text at source level (JS detection unreliable in headless)
+    html = _fix_clip_text_in_css(html)
+
+    # Fix 4: inject override style
     if "</head>" in html:
         html = html.replace("</head>", PDF_OVERRIDE_CSS, 1)
 
@@ -115,6 +133,24 @@ async def render_pdf(input_path: Path, output_path: Path) -> None:
     tmp_path = input_path.with_suffix(".tmp_pdf.html")
     tmp_path.write_text(html, encoding="utf-8")
 
+    FIX_CLIP_TEXT_JS = """
+(function fixBackgroundClipText() {
+  document.querySelectorAll('*').forEach(el => {
+    const cs = getComputedStyle(el);
+    const clip = cs.backgroundClip || cs.webkitBackgroundClip;
+    if (clip === 'text') {
+      const textColor = cs.color || '#1A202C';
+      el.style.setProperty('-webkit-text-fill-color', textColor, 'important');
+      el.style.setProperty('color',                  textColor, 'important');
+      el.style.setProperty('background-image',       'none',    'important');
+      el.style.setProperty('background-color',       'transparent', 'important');
+      el.style.setProperty('-webkit-background-clip','initial', 'important');
+      el.style.setProperty('background-clip',        'initial', 'important');
+    }
+  });
+})();
+"""
+
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
@@ -125,6 +161,7 @@ async def render_pdf(input_path: Path, output_path: Path) -> None:
             page = await context.new_page()
             await page.goto(tmp_path.as_uri(), wait_until="networkidle", timeout=90000)
             await page.wait_for_timeout(2000)
+            await page.evaluate(FIX_CLIP_TEXT_JS)
             await page.pdf(
                 path=str(output_path),
                 format="A4",

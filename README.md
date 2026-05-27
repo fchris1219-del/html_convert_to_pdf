@@ -61,7 +61,17 @@ python3 html-pdf/convert.py "/path/to/file.html" "/path/to/output.pdf"
 
 `<feGaussianBlur>` 是最强力的栅格化触发器，会强制将滤镜覆盖的整个子树位图化。将 `stdDeviation` 设为 0 相当于关闭模糊，视觉变化极小。
 
-#### 3. CSS 覆盖层注入
+#### 3. 渐变文字 → 纯色（双重修复）
+
+**根因：** `background-clip:text` + `-webkit-text-fill-color:transparent` 实现的渐变文字，在 Chromium PDF 渲染时会产生 SMask 透明组，导致不同 PDF 阅读器出现黑色色块、红色/色偏等渲染错误。
+
+**修复策略（两道保险）：**
+1. **源码级**：用正则在 HTML 中找到同时含 `background-clip:text` 和 `-webkit-text-fill-color:transparent` 的 CSS 规则块，直接删除渐变相关属性
+2. **JS 运行时**：渲染后再次遍历所有元素，检测 `backgroundClip === 'text'` 的元素，将 `color`/`-webkit-text-fill-color` 设为计算后的实色，清除渐变背景
+
+两道保险确保 headless 环境下无论哪种写法都能被捕获。
+
+#### 4. CSS 覆盖层注入
 
 ```css
 *, *::before, *::after {
@@ -76,7 +86,7 @@ python3 html-pdf/convert.py "/path/to/file.html" "/path/to/output.pdf"
 
 注意：**不覆盖 `transform`**，避免破坏依赖 `translateX(-50%)` 居中的布局。
 
-#### 4. Playwright 渲染
+#### 5. Playwright 渲染
 
 - `wait_until="networkidle"` + 额外等待 2s，确保字体/懒加载完成
 - `device_scale_factor=3` 提升位图回退质量
@@ -88,7 +98,8 @@ python3 html-pdf/convert.py "/path/to/file.html" "/path/to/output.pdf"
 |------|------|------|
 | 某行/区域文字模糊 | rgba 半透明 + 底层渐变合成 | 脚本 Fix 1（白名单替换） |
 | 全页模糊 | feGaussianBlur 未清除 | 脚本 Fix 2（stdDeviation=0） |
-| PDF 四边有白边 | @page margin 未清零 | 脚本 Fix 3 CSS |
+| 渐变文字变黑块/红色 | PDF SMask 透明组渲染错误 | 脚本 Fix 3（源码级 + JS 双重修复） |
+| PDF 四边有白边 | @page margin 未清零 | 脚本 Fix 4 CSS |
 | 某些元素位置偏移 | 不要覆盖 transform！ | 脚本已确保不覆盖 |
 | 字体未加载/方块字 | 网络字体加载超时 | 将 `wait_for_timeout` 改为 4000ms |
 | 内容被截断 | .page max-height 太小 | 检查 HTML 是否正确设置 297mm |
